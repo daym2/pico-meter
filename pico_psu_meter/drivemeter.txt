@@ -8,6 +8,7 @@ import array
 import machine
 import utime
 from machine import Pin, Timer
+#another line
 
 bit0 = Pin(0, Pin.OUT)
 bit1 = Pin(1, Pin.OUT)

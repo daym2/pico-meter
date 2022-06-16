@@ -335,7 +335,7 @@ def scaleMeterReading(fsd_val, val_now):
 #
 # Determine whether in Voltage or current mode
 # and calculate range to use for driving meter.
-# Uses a filter to prevent rapid range switching. 
+# Uses a filter to prevent rapid range switching. TODO: remove the filter and change range selection method. 
 #
 def calcModeAndRange(Volts, Curr):
     RANGE_50   = 0x100

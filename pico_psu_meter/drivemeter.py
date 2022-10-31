@@ -15,6 +15,9 @@ import machine
 import utime
 from machine import Pin, Timer
 
+# An 8-bit R2R ladder DAC is used to drive the meter via a
+# single transistor V->I converter 
+# Range of meter is 0 to 1mA
 bit0 = Pin(0, Pin.OUT)
 bit1 = Pin(1, Pin.OUT)
 bit2 = Pin(2, Pin.OUT)
@@ -23,13 +26,20 @@ bit4 = Pin(4, Pin.OUT)
 bit5 = Pin(5, Pin.OUT)
 bit6 = Pin(6, Pin.OUT)
 bit7 = Pin(7, Pin.OUT)
+
 led = Pin(25, Pin.OUT)
-#adc = machine.ADC(0)
+
+
+# ADC Channels
+#=============
+# direct reading of output voltage
 opVoltRdg = machine.ADC(0)
+# current is read as a voltage across a 0.3 ohm resistor
 opCurrRdg = machine.ADC(1)
+# 0v output is measured to offset various physical effects
 op0vRdg = machine.ADC(2)
 
-# range leds
+# meter range indication leds
 pin100m = Pin(8,  Pin.OUT)
 pin250m = Pin(9,  Pin.OUT)
 pin500m = Pin(10, Pin.OUT)
@@ -40,21 +50,21 @@ pin10v  = Pin(14, Pin.OUT)
 pin25v  = Pin(15, Pin.OUT)
 pin50v  = Pin(16, Pin.OUT)
 
-#onboard led
+# GPIO Pin 21 is used to detect current limit mode. 
+pinILim = Pin(21, Pin.In)
+
+# onboard led (channel 25) is used to indicate how much 
+# time the processor is spending awake.  If it lights 
+# up very brightly, things are getting bad.
 led.value(0)
 LED_state = True
-tim = Timer()
+
+# timer used to schedule measurements / update
 meterUpdateTim = Timer()
 
-
 ### timer callbacks ###
-
-def tick(timer):
-    global led, LED_state
-    LED_state = not LED_state
-    led.value(LED_state)
     
-# meter update timer
+# meter update timer callback
 def meterUpdateTick(timer):
     led.high()
     updateRdgs()
@@ -125,7 +135,8 @@ def showRange(pattern):
 
 #
 # driveMeter
-# Set the meter drive to the position associated with val. 
+# Send a binary number out to the R-2R DAC which will drive the meter
+# pointer to a particular position.  
 #
 def driveMeter(mask=0):   
     if (mask & 0x01 == 0):
@@ -173,38 +184,26 @@ def driveMeter(mask=0):
 # Show a startup pattern to indicate that all lamps / meter work. 
 #
 def lampTest():
-    showRange(0x001)
-    utime.sleep(0.25)
-    showRange(0x003)
-    utime.sleep(0.25)
-    showRange(0x007)
-    utime.sleep(0.25)
-    showRange(0x00f)
-    utime.sleep(0.25)
-    showRange(0x01f)
-    utime.sleep(0.25)
-    showRange(0x03f)
-    utime.sleep(0.25)
-    showRange(0x07f)
-    utime.sleep(0.25)
-    showRange(0x0ff)
-    utime.sleep(0.25)
-    showRange(0x1FF)
-    driveMeter(200)
+    driveMeter(200) # full scale deflection. 
+    showRange(0x1FF) # all range indicators on. 
     utime.sleep(1)
     driveMeter(0)
-    showRange(0)
+    showRange(0) # all range indicators off
     utime.sleep(0.5)
 
 
 #
-# given a value that would drive FSD in the current range and the current value,
-# determine the percentage of FSD that the meter should be driven to.
+# given a value that would drive FSD in the current range and the 
+# current value, determine the percentage of FSD that the meter 
+# should be driven to.  Absolute values are given for each graticule 
+# position.  The function interpolates for values between graticule 
+# positions. 
 # Meter calibration is done here. 
-#
+#TODO: This is ugly.  A table based solution would be t
 def scaleMeterReading(fsd_val, val_now):
     global meterDriveIdx
     global meterDriveFilt
+    # list DAC counts to drive indicator to each graticule. 
     pc0 = 31
     pc4 = 49
     pc8 = 57
@@ -316,27 +315,18 @@ def scaleMeterReading(fsd_val, val_now):
         pr = pcVal / 0.04
         drive = pc0 + int(pr*(pc4-pc0))
      
-    if meterDriveIdx > 2:
-        meterDriveIdx = 0
-    else:
-        meterDriveIdx +=1
-    if meterDriveIdx > 3:
-        meterDriveIdx = 0
-    meterDriveFilt[meterDriveIdx] = drive
-    aveDrv = 0
-    for i in range (4):
-        aveDrv += meterDriveFilt[i]
-    aveDrv = aveDrv >> 2
+    # and finally, drive the meter...
         
-    print ("%drive: ", aveDrv)
+    print ("%drive: ", drive)
     
-    driveMeter(aveDrv)
+    driveMeter(drive)
 
 #
 # Determine whether in Voltage or current mode
 # and calculate range to use for driving meter.
 # Uses a filter to prevent rapid range switching. TODO: remove the filter and change range selection method. 
 #
+#TODO: add hysteresis for range changes 
 def calcModeAndRange(Volts, Curr):
     RANGE_50   = 0x100
     RANGE_25   = 0x080
@@ -355,6 +345,7 @@ def calcModeAndRange(Volts, Curr):
     vMode = True
     #for now
     if vMode == True:
+        # voltage scales
         if Volts > 25:
             nextRange = RANGE_50
             fsVal = 50
@@ -383,6 +374,7 @@ def calcModeAndRange(Volts, Curr):
             nextRange = RANGE_100m
             fsVal = 0.1
     else:
+        # current scales
         if Curr > 2.5:
             nextRange = RANGE_5
             fsVal = 5
@@ -403,6 +395,7 @@ def calcModeAndRange(Volts, Curr):
             fsVal = 0.1
             
 #    if changeFilt < RANGE_CHANGE_FILTER_COUNT:
+#TODO: remove range change filtering.  Use hysteresis instead. 
     if changeFilt < 4:
         changeFilt += 1
     else:
@@ -417,6 +410,9 @@ def calcModeAndRange(Volts, Curr):
  
 #
 # updateRdgs
+# Read and average the readings for output voltage, output current and 
+# the zero point to offset both of those from. 
+# Readings are held as an integer value. 
 #
 def updateRdgs():
     global opVarr
@@ -431,27 +427,24 @@ def updateRdgs():
         opIarr[i] = opCurrRdg.read_u16()>>4
         op0varr[i] = op0vRdg.read_u16()>>4
     
-    # get averated raw output voltage adc count
+    # get averaged raw adc counts
     voltsVal = 0
+    iVal = 0
+    volt0Val = 0
     for i in range(len(opVarr)):
         voltsVal = voltsVal + opVarr[i]
-        
+        iVal = iVal + opIarr[i]
+        volt0Val = volt0Val + op0varr[i]
+
+    # averaged raw output voltage adc count    
     voltsVal = voltsVal / len(opVarr)
     voltsVal = int(voltsVal)
     
     # averaged raw output current adc count
-    iVal = 0
-    for i in range(len(opIarr)):
-        iVal = iVal + opIarr[i]
-        
     iVal = iVal / len(opIarr)
     iVal = int(iVal)
     
     # averaged raw 0V voltage adc count
-    volt0Val = 0
-    for i in range(len(op0varr)):
-        volt0Val = volt0Val + op0varr[i]
-        
     volt0Val = volt0Val / len(op0varr)
     volt0Val = int(volt0Val)
 
@@ -459,14 +452,16 @@ def updateRdgs():
     if voltsVal > volt0Val:
         voltsVal -= volt0Val
     else:
+        # negative voltage!
         voltsVal = 0
-        print("op volt error")
+        print("op volt error")  
     #scale to real voltage
     voltsOut = voltsVal* VOLTS_PER_INCREMENT
         
     if iVal > volt0Val:
         iVal = iVal-volt0Val
     else:
+        # negative current!
         iVal = 0
         print ("op I error")
 
@@ -505,10 +500,8 @@ changeFilt = 0
 currentRange = 0
 meterDriveFilt = [0, 0, 0, 0]
 meterDriveIdx = 0
-# initialise the led flash timer. 
-#tim.init(freq=1, mode=Timer.PERIODIC, callback=tick)
 
-# and the meter update timer
-tim.init(freq=10, mode=Timer.PERIODIC, callback=meterUpdateTick)
+# The meter update timer schedules running of the meter update code
+meterUpdateTim.init(freq=10, mode=Timer.PERIODIC, callback=meterUpdateTick)
 
 

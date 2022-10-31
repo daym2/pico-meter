@@ -51,7 +51,7 @@ pin25v  = Pin(15, Pin.OUT)
 pin50v  = Pin(16, Pin.OUT)
 
 # GPIO Pin 21 is used to detect current limit mode. 
-pinILim = Pin(21, Pin.In)
+pinILim = Pin(21, Pin.IN)
 
 # onboard led (channel 25) is used to indicate how much 
 # time the processor is spending awake.  If it lights 

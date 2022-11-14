@@ -1,4 +1,35 @@
-#to run standalone on the pico, file must be called main.py
+
+# _________________________________________
+#/ This is a program that manages the      \
+#| display front panel of a Power Supply   |
+#| Unit from Practical Electronics 1978.   |
+#| Design of the PSU was by R. Lawrence    |
+#| B.Sc. This program drives a moving coil |
+#| meter and lights a few LEDs on the      |
+#| front panel to indicate what the range  |
+#| of the meter is, whether the PSU is in  |
+#| current limit mode etc. The program     |
+#| monitors a current-limit indicator      |
+#| light on the PSU control board to       |
+#| determine whether to show volts or      |
+#| amps. It doesn't need to be fast -      |
+#| polling is fine. The PSU's overcurrent  |
+#| detection is done in hardware. This is  |
+#| just monitoring and pretty displaying   |
+#| things. It runs on the Raspberry Pi     |
+#| pico board but with R7 removed and a    |
+#| very highly filtered ADC_VREF supply    |
+#| provided externally for the small       |
+#\ voltage measurements                    /
+# -----------------------------------------
+#        \   ^__^
+#         \  (oo)\_______
+#            (__)\       )\/\
+#                ||----w |
+#                ||     ||
+#
+
+# note: to run standalone on the pico, file must be called main.py
 
 #TODO:
 # set gpio23 high for continuous PWM SMPS operation. 
@@ -6,8 +37,11 @@
 # One ADC count represents...
 MAX_VOLTS_OUT = 36
 FULL_SCALE_COUNT = 4096
-VOLTS_PER_INCREMENT = (MAX_VOLTS_OUT / FULL_SCALE_COUNT)
+VOLTS_PER_ADC_STEP = (MAX_VOLTS_OUT / FULL_SCALE_COUNT)
 ISENSE_R_VAL_OHMS = 0.3
+
+MAX_AMPS_OUT = 6
+AMPS_PER_ADC_STEP = (MAX_AMPS_OUT / FULL_SCALE_COUNT)
 
 #initialisation
 import array
@@ -53,28 +87,56 @@ pin50v  = Pin(16, Pin.OUT)
 # GPIO Pin 21 is used to detect current limit mode. 
 pinILim = Pin(21, Pin.IN)
 
-# onboard led (channel 25) is used to indicate how much 
-# time the processor is spending awake.  If it lights 
-# up very brightly, things are getting bad.
+# onboard led (channel 25) is used to indicate how much time the processor is
+# spending awake.  If it never switches off, slow down the scheduling timer. 
 led.value(0)
-LED_state = True
 
 # timer used to schedule measurements / update
 meterUpdateTim = Timer()
 
-### timer callbacks ###
-    
-# meter update timer callback
-def meterUpdateTick(timer):
-    led.high()
-    updateRdgs()
-    led.low()
+### Aliases for the indicator lamps ###
+RANGE_INDICATOR_LAMP_100m = 0x001
+RANGE_INDICATOR_LAMP_250m = 0x002
+RANGE_INDICATOR_LAMP_500m = 0x004
+RANGE_INDICATOR_LAMP_1 =    0x008
+RANGE_INDICATOR_LAMP_2P5 =  0x010
+RANGE_INDICATOR_LAMP_5 =    0x020
+RANGE_INDICATOR_LAMP_10 =   0x040
+RANGE_INDICATOR_LAMP_25 =   0x080
+RANGE_INDICATOR_LAMP_50 =   0x100
+RANGE_INDICATOR_LAMPS_ALL = 0x1FF
+RANGE_INDICATOR_LAMPS_NONE = 0
 
 
 ### functions ###
 
+############ meter update timer callback #############
+#                   _            _    _           _       _    _______ _                  _______ _      _    
+#                  | |          | |  | |         | |     | |  |__   __(_)                |__   __(_)    | |   
+#    _ __ ___   ___| |_ ___ _ __| |  | |_ __   __| | __ _| |_ ___| |   _ _ __ ___   ___ _ __| |   _  ___| | __
+#   | '_ ` _ \ / _ \ __/ _ \ '__| |  | | '_ \ / _` |/ _` | __/ _ \ |  | | '_ ` _ \ / _ \ '__| |  | |/ __| |/ /
+#   | | | | | |  __/ ||  __/ |  | |__| | |_) | (_| | (_| | ||  __/ |  | | | | | | |  __/ |  | |  | | (__|   < 
+#   |_| |_| |_|\___|\__\___|_|   \____/| .__/ \__,_|\__,_|\__\___|_|  |_|_| |_| |_|\___|_|  |_|  |_|\___|_|\_\
+#                                      | |                                                                    
+#                                      |_|                                                                    
+# 
+# Called periodically to monitor things and update indicators / meter position. 
+def meterUpdateTick(timer):
+    led.high()
+    updateRdgs()  # and do everything else...
+    led.low()
+
+
 #
-# showRange
+############ showRange ############
+#        _                   _____                        
+#       | |                 |  __ \                       
+#    ___| |__   _____      _| |__) |__ _ _ __   __ _  ___ 
+#   / __| '_ \ / _ \ \ /\ / /  _  // _` | '_ \ / _` |/ _ \
+#   \__ \ | | | (_) \ V  V /| | \ \ (_| | | | | (_| |  __/
+#   |___/_| |_|\___/ \_/\_/ |_|  \_\__,_|_| |_|\__, |\___|
+#                                               __/ |     
+#                                              |___/      
 # Light one or more range LEDs according to the bit pattern given. 
 #
 def showRange(pattern):
@@ -134,76 +196,105 @@ def showRange(pattern):
         pin50v.high()
 
 #
-# driveMeter
-# Send a binary number out to the R-2R DAC which will drive the meter
-# pointer to a particular position.  
-#
-def driveMeter(mask=0):   
-    if (mask & 0x01 == 0):
+############ driveMeterDAC ############
+#        _      _           __  __      _            _____          _____ 
+#       | |    (_)         |  \/  |    | |          |  __ \   /\   / ____|
+#     __| |_ __ ___   _____| \  / | ___| |_ ___ _ __| |  | | /  \ | |     
+#    / _` | '__| \ \ / / _ \ |\/| |/ _ \ __/ _ \ '__| |  | |/ /\ \| |     
+#   | (_| | |  | |\ V /  __/ |  | |  __/ ||  __/ |  | |__| / ____ \ |____ 
+#    \__,_|_|  |_| \_/ \___|_|  |_|\___|\__\___|_|  |_____/_/    \_\_____|
+#                                                                         
+#                                                                         
+# Send a binary number out to the R-2R Digital to Analogue Converter which will
+# drive the meter pointer to the required position. The value is masked to write
+# out the drive value bit by bit. 
+# 
+def driveMeterDAC(dacValue=0):   
+    if (dacValue & 0x01 == 0):
         bit0.low()
     else:
         bit0.high()
 
-    if (mask & 0x02 == 0):
+    if (dacValue & 0x02 == 0):
         bit1.low()
     else:
         bit1.high()
 
-    if (mask & 0x04 == 0):
+    if (dacValue & 0x04 == 0):
         bit2.low()
     else:
         bit2.high()
 
-    if (mask & 0x08 == 0):
+    if (dacValue & 0x08 == 0):
         bit3.low()
     else:
         bit3.high()
 
-    if (mask & 0x10 == 0):
+    if (dacValue & 0x10 == 0):
         bit4.low()
     else:
         bit4.high()
 
-    if (mask & 0x20 == 0):
+    if (dacValue & 0x20 == 0):
         bit5.low()
     else:
         bit5.high()
 
-    if (mask & 0x40 == 0):
+    if (dacValue & 0x40 == 0):
         bit6.low()
     else:
         bit6.high()
                                 
-    if (mask & 0x80 == 0):
+    if (dacValue & 0x80 == 0):
         bit7.low()
     else:
         bit7.high()
                                 
-#
-# lampTest
-# Show a startup pattern to indicate that all lamps / meter work. 
-#
+
+############# lampTest ############
+#    _                    _______        _   
+#   | |                  |__   __|      | |  
+#   | | __ _ _ __ ___  _ __ | | ___  ___| |_ 
+#   | |/ _` | '_ ` _ \| '_ \| |/ _ \/ __| __|
+#   | | (_| | | | | | | |_) | |  __/\__ \ |_ 
+#   |_|\__,_|_| |_| |_| .__/|_|\___||___/\__|
+#                     | |                    
+#                     |_|                    
+# An impressive display of meter needle movement and LED lighting when the
+# program starts running.  Proves that both are working. A half second blanking
+# is done to allow the observer to recover. 
+# 
 def lampTest():
-    driveMeter(200) # full scale deflection. 
-    showRange(0x1FF) # all range indicators on. 
+    driveMeterToPercentFS(100)
+    showRange(RANGE_INDICATOR_LAMPS_ALL)
     utime.sleep(1)
-    driveMeter(0)
-    showRange(0) # all range indicators off
+    driveMeterToPercentFS(0)
+    showRange(RANGE_INDICATOR_LAMPS_NONE)
     utime.sleep(0.5)
 
 
 #
-# given a value that would drive FSD in the current range and the 
-# current value, determine the percentage of FSD that the meter 
-# should be driven to.  Absolute values are given for each graticule 
-# position.  The function interpolates for values between graticule 
-# positions. 
-# Meter calibration is done here. 
-#TODO: This is ugly.  A table based solution would be t
-def scaleMeterReading(fsd_val, val_now):
-    global meterDriveIdx
-    global meterDriveFilt
-    # list DAC counts to drive indicator to each graticule. 
+############# driveMeterToPercentFS #############
+#        _      _           __  __      _         _______    _____                        _   ______ _____ 
+#       | |    (_)         |  \/  |    | |       |__   __|  |  __ \                      | | |  ____/ ____|
+#     __| |_ __ ___   _____| \  / | ___| |_ ___ _ __| | ___ | |__) |__ _ __ ___ ___ _ __ | |_| |__ | (___  
+#    / _` | '__| \ \ / / _ \ |\/| |/ _ \ __/ _ \ '__| |/ _ \|  ___/ _ \ '__/ __/ _ \ '_ \| __|  __| \___ \ 
+#   | (_| | |  | |\ V /  __/ |  | |  __/ ||  __/ |  | | (_) | |  |  __/ | | (_|  __/ | | | |_| |    ____) |
+#    \__,_|_|  |_| \_/ \___|_|  |_|\___|\__\___|_|  |_|\___/|_|   \___|_|  \___\___|_| |_|\__|_|   |_____/ 
+#                                                                                                          
+#                                                                                                          
+# Given the percentage of Full Scale Deflection that the needle should indicate,
+# calculate the DAC count that the meter should be driven with. 
+# 
+def driveMeterToPercentFS(pcVal):
+
+    ###########  METER CALIBRATION VALUES ##########
+    # The meter has 25 graticules, so each represents 4% of Full Scale
+    # Deflection.  Below this comment is a list of DAC counts to drive the
+    # indicator to each graticule because the system is not really linear.
+    # Calibration used a test program to read an ADC input driven from a
+    # potentiometer and print out the ADC count while the needle was moved to
+    # each graticule position using the potentiometer.  
     pc0 = 31
     pc4 = 49
     pc8 = 57
@@ -232,7 +323,8 @@ def scaleMeterReading(fsd_val, val_now):
     pc100 = 200
     pc104 = 205
     
-    pcVal = val_now / fsd_val
+    pcVal = pcVal / 100 # because this evolved using per-unit values. 
+    # needle is never driven beyond 4% past the last graticule. 
     if pcVal > 1.04:
         pcVal = 1.04
         drive = pc104
@@ -315,18 +407,25 @@ def scaleMeterReading(fsd_val, val_now):
         pr = pcVal / 0.04
         drive = pc0 + int(pr*(pc4-pc0))
      
-    # and finally, drive the meter...
+    # and finally, send the drive value to the Digital to Analogue Converter...
+    driveMeterDAC(drive) 
         
-    print ("%drive: ", drive)
+    # print ("%drive: ", drive)
     
-    driveMeter(drive)
 
-#
-# Determine whether in Voltage or current mode
-# and calculate range to use for driving meter.
-# Uses a filter to prevent rapid range switching. TODO: remove the filter and change range selection method. 
-#
-#TODO: add hysteresis for range changes 
+############# calcModeAndRange ############
+#            _      __  __           _                         _ _____                        
+#           | |    |  \/  |         | |        /\             | |  __ \                       
+#   ___ __ _| | ___| \  / | ___   __| | ___   /  \   _ __   __| | |__) |__ _ _ __   __ _  ___ 
+#  / __/ _` | |/ __| |\/| |/ _ \ / _` |/ _ \ / /\ \ | '_ \ / _` |  _  // _` | '_ \ / _` |/ _ \
+# | (_| (_| | | (__| |  | | (_) | (_| |  __// ____ \| | | | (_| | | \ \ (_| | | | | (_| |  __/
+#  \___\__,_|_|\___|_|  |_|\___/ \__,_|\___/_/    \_\_| |_|\__,_|_|  \_\__,_|_| |_|\__, |\___|
+#                                                                                   __/ |     
+#                                                                                  |___/      
+# Determine whether we should be displaying Voltage or current and calculate a
+# suitable display range for the value being measured. 
+# 
+# Hysteresis is applied when changing down through ranges via the limit definitions. 
 def calcModeAndRange(Volts, Curr):
     RANGE_50   = 0x100
     RANGE_25   = 0x080
@@ -337,89 +436,177 @@ def calcModeAndRange(Volts, Curr):
     RANGE_500m = 0x004
     RANGE_250m = 0x002
     RANGE_100m = 0x001
-    RANGE_CHANGE_FILTER_COUNT = 3
-    global changeFilt
-    global currentRange
-    
-    #TODO: read input pin from current mode detect
-    vMode = True
-    #for now
+
+    # Defines limits of voltage and current for each range. 
+    RANGE_50_LOW_LIM = 20.0
+    RANGE_25_HIGH_LIM = 25.0
+    RANGE_25_LOW_LIM = 8.0
+    RANGE_10_HIGH_LIM = 10.0
+    RANGE_10_LOW_LIM = 4.0
+    RANGE_5_HIGH_LIM = 5.0
+    RANGE_5_LOW_LIM = 2.0
+    RANGE_2P5_HIGH_LIM = 2.5
+    RANGE_2P5_LOW_LIM = 0.8
+    RANGE_1_HIGH_LIM = 1.0
+    RANGE_1_LOW_LIM = 0.4
+    RANGE_500m_HIGH_LIM = 0.5
+    RANGE_500m_LOW_LIM = 0.2
+    RANGE_250m_HIGH_LIM = 0.25
+    RANGE_250m_LOW_LIM = 0.08
+    RANGE_100m_HIGH_LIM = 0.1
+
+    # Read pinILim to determine whether displaying volts or amps
+    vMode = pinILim.value()
+    #print ("vMode: ", vMode)
+    # TODO: drive the mode indicator relay lamp here. 
+
     if vMode == True:
         # voltage scales
-        if Volts > 25:
-            nextRange = RANGE_50
-            fsVal = 50
-        elif Volts > 10:
-            nextRange = RANGE_25
-            fsVal = 25
-        elif Volts > 5:
-            nextRange = RANGE_10
-            fsVal = 10
-        elif Volts > 2.5:
-            nextRange = RANGE_5
-            fsVal = 5
-        elif Volts > 1:
-            nextRange = RANGE_2P5
-            fsVal = 2.5
-        elif Volts > 0.5:
-            nextRange = RANGE_1
-            fsVal = 1
-        elif Volts > 0.25:
-            nextRange = RANGE_500m
-            fsVal = 0.5
-        elif Volts > 0.1:
-            nextRange = RANGE_250m
-            fsVal = 0.25
-        else:
-            nextRange = RANGE_100m
-            fsVal = 0.1
+        if rangeVolts == RANGE_50:
+            # there is no higher voltage range. 
+            if Volts < RANGE_50_LOW_LIM:
+                rangeVolts = RANGE_25
+                showRange(RANGE_INDICATOR_LAMP_25)
+        elif rangeVolts == RANGE_25:
+            if Volts > RANGE_25_HIGH_LIM:
+                rangeVolts = RANGE_50
+                showRange(RANGE_INDICATOR_LAMP_50)
+            elif Volts < RANGE_25_LOW_LIM:
+                rangeVolts = RANGE_10
+                showRange(RANGE_INDICATOR_LAMP_10)
+        elif rangeVolts == RANGE_10:
+            if Volts > RANGE_10_HIGH_LIM:
+                rangeVolts = RANGE_25
+                showRange(RANGE_INDICATOR_LAMP_25)
+            elif Volts < RANGE_10_LOW_LIM:
+                rangeVolts = RANGE_5
+                showRange(RANGE_INDICATOR_LAMP_5)
+        elif rangeVolts == RANGE_5:
+            if Volts > RANGE_5_HIGH_LIM:
+                rangeVolts = RANGE_10
+                showRange(RANGE_INDICATOR_LAMP_10)
+            elif Volts < RANGE_5_LOW_LIM:
+                rangeVolts = RANGE_2P5
+                showRange(RANGE_INDICATOR_LAMP_2P5)
+        elif rangeVolts == RANGE_2P5:
+            if Volts > RANGE_2P5_HIGH_LIM:
+                rangeVolts = RANGE_5
+                showRange(RANGE_INDICATOR_LAMP_5)
+            elif Volts < RANGE_2P5_LOW_LIM:
+                rangeVolts = RANGE_1
+                showRange(RANGE_INDICATOR_LAMP_1)
+        elif rangeVolts == RANGE_1:
+            if Volts > RANGE_1_HIGH_LIM:
+                rangeVolts = RANGE_2P5
+                showRange(RANGE_INDICATOR_LAMP_2P5)
+            elif Volts < RANGE_1_LOW_LIM:
+                rangeVolts = RANGE_500m
+                showRange(RANGE_INDICATOR_LAMP_500m)
+        elif rangeVolts == RANGE_500m:
+            if Volts > RANGE_500m_HIGH_LIM:
+                rangeVolts = RANGE_1
+                showRange(RANGE_INDICATOR_LAMP_1)
+            elif Volts < RANGE_500m_LOW_LIM:
+                rangeVolts = RANGE_250m
+                showRange(RANGE_INDICATOR_LAMP_250m)
+        elif rangeVolts == RANGE_250m:
+            if Volts > RANGE_250m_HIGH_LIM:
+                rangeVolts = RANGE_500m
+                showRange(RANGE_INDICATOR_LAMP_500m)
+            elif Volts < RANGE_250m_LOW_LIM:
+                rangeVolts = RANGE_100m
+                showRange(RANGE_INDICATOR_LAMP_100m)
+        else: # rangeVolts is 100m or invalid. 
+            if Volts > RANGE_100m_HIGH_LIM:
+                rangeVolts = RANGE_250m
+                showRange(RANGE_INDICATOR_LAMP_250m)
+            else:
+                rangeVolts = RANGE_100m
+                showRange(RANGE_INDICATOR_LAMP_100m)
+            # there are no lower voltage ranges
+        # Now calculate the percentage of full scale for volts...
+        perCentDrive = rangeVolts / Volts
+        perCentDrive = perCentDrive * 100
+        driveMeterToPercentFS(perCentDrive) 
+        # here endeth the voltage meter driving. 
+
     else:
-        # current scales
-        if Curr > 2.5:
-            nextRange = RANGE_5
-            fsVal = 5
-        elif Curr > 1:
-            nextRange = RANGE_2P5
-            fsVal = 2.5
-        elif Curr > 0.5:
-            nextRange = RANGE_1
-            fsVal = 1
-        elif Curr > 0.25:
-            nextRange = RANGE_500m
-            fsVal = 0.5
-        elif Curr > 0.1:
-            nextRange = RANGE_250m
-            fsVal = 0.25
-        else:
-            nextRange = RANGE_100m
-            fsVal = 0.1
-            
-#    if changeFilt < RANGE_CHANGE_FILTER_COUNT:
-#TODO: remove range change filtering.  Use hysteresis instead. 
-    if changeFilt < 4:
-        changeFilt += 1
-    else:
-        currentRange = nextRange
-        showRange(currentRange)
-        changeFilt = 0
-        #scale meter position to range depending on v / i value. 
-        if vMode == True:
-            scaleMeterReading(fsVal, Volts)    
-        else:
-            scaleMeterReading(fsVal, Curr)    
- 
-#
-# updateRdgs
+        # PSU is in current limit mode.  Display Current. 
+        if rangeAmps == RANGE_10:
+            # No point changing to higher ranges. The output transistor will
+            # melt if current gets any higher. 
+            if Curr < RANGE_10_LOW_LIM:
+                rangeAmps = RANGE_5
+                showRange(RANGE_INDICATOR_LAMP_5)
+        elif rangeAmps == RANGE_5:
+            if Curr > RANGE_5_HIGH_LIM:
+                rangeAmps = RANGE_10
+                showRange(RANGE_INDICATOR_LAMP_10)
+            elif Curr < RANGE_5_LOW_LIM:
+                rangeAmps = RANGE_2P5
+                showRange(RANGE_INDICATOR_LAMP_2P5)
+        elif rangeAmps == RANGE_2P5:
+            if Curr > RANGE_2P5_HIGH_LIM:
+                rangeAmps = RANGE_5
+                showRange(RANGE_INDICATOR_LAMP_5)
+            elif Curr < RANGE_2P5_LOW_LIM:
+                rangeAmps = RANGE_1
+                showRange(RANGE_INDICATOR_LAMP_1)
+        elif rangeAmps == RANGE_1:
+            if Curr > RANGE_1_HIGH_LIM:
+                rangeAmps = RANGE_2P5
+                showRange(RANGE_INDICATOR_LAMP_2P5)
+            elif Curr < RANGE_1_LOW_LIM:
+                rangeAmps = RANGE_500m
+                showRange(RANGE_INDICATOR_LAMP_500m)
+        elif rangeAmps == RANGE_500m:
+            if Curr > RANGE_500m_HIGH_LIM:
+                rangeAmps = RANGE_1
+                showRange(RANGE_INDICATOR_LAMP_1)
+            elif Curr < RANGE_500m_LOW_LIM:
+                rangeAmps = RANGE_250m
+                showRange(RANGE_INDICATOR_LAMP_250m)
+        elif rangeAmps == RANGE_250m:
+            if Curr > RANGE_250m_HIGH_LIM:
+                rangeAmps = RANGE_500m
+                showRange(RANGE_INDICATOR_LAMP_500m)
+            elif Curr < RANGE_250m_LOW_LIM:
+                rangeAmps = RANGE_100m
+                showRange(RANGE_INDICATOR_LAMP_100m)
+        else: # rangeAmps is 100m or invalid. 
+            if Curr > RANGE_100m_HIGH_LIM:
+                rangeAmps = RANGE_250m
+                showRange(RANGE_INDICATOR_LAMP_250m)
+            else:
+                rangeAmps = RANGE_100m
+                showRange(RANGE_INDICATOR_LAMP_100m)
+            # there are no lower current ranges
+        # Now calculate the percentage of full scale for current...
+        perCentDrive = rangeAmps / Curr
+        perCentDrive = perCentDrive * 100
+        driveMeterToPercentFS(perCentDrive)
+    # end of changing and scaling current ranges. 
+
+
+
+############# updateRdgs ##############
+#                  _       _       _____     _           
+#                 | |     | |     |  __ \   | |          
+#  _   _ _ __   __| | __ _| |_ ___| |__) |__| | __ _ ___ 
+# | | | | '_ \ / _` |/ _` | __/ _ \  _  // _` |/ _` / __|
+# | |_| | |_) | (_| | (_| | ||  __/ | \ \ (_| | (_| \__ \
+#  \__,_| .__/ \__,_|\__,_|\__\___|_|  \_\__,_|\__, |___/
+#       | |                                     __/ |    
+#       |_|                                    |___/     
 # Read and average the readings for output voltage, output current and 
-# the zero point to offset both of those from. 
-# Readings are held as an integer value. 
+# the zero point from which both of those are referenced. 
+# Readings are held as integer values. 
 #
 def updateRdgs():
     global opVarr
     global opIarr
     global op0varr
     
-    print ("arr len: ", len(opVarr))
     # Read all three ADCs and shift to give range 0 - 4096.
     # All arrays are the same length so just using size of first array
     for i in range(len(opVarr)):
@@ -456,52 +643,56 @@ def updateRdgs():
         voltsVal = 0
         print("op volt error")  
     #scale to real voltage
-    voltsOut = voltsVal* VOLTS_PER_INCREMENT
+    voltsOut = voltsVal* VOLTS_PER_ADC_STEP
         
     if iVal > volt0Val:
         iVal = iVal-volt0Val
     else:
-        # negative current!
+        # negative current!  Maybe light the amber measurement warning lamp?  
         iVal = 0
         print ("op I error")
 
-    iOut = iVal * VOLTS_PER_INCREMENT
-    iOut /= ISENSE_R_VAL_OHMS
+    iOut = iVal * AMPS_PER_ADC_STEP
 
     calcModeAndRange(voltsOut, iOut)
     
-    #divide by 16 to get 0 -256 range for driving meter
-#    meterVal = voltsVal >> 4
-#    driveMeter(meterVal)
-    
-    print("voltsVal: ", voltsVal)
-    print("0vVal: ",volt0Val)
-    print("iVal: ", iVal)
-    print("voltsOut: ", voltsOut)
-    print("iOut: ", iOut)
+# remnants of the test program to display the DAC bits...    
+#    print("voltsVal: ", voltsVal)
+#    print("0vVal: ",volt0Val)
+#    print("iVal: ", iVal)
+#    print("voltsOut: ", voltsOut)
+#    print("iOut: ", iOut)
 #    print("meterVal: ", meterVal)
     
-    print(bit7.value(),bit6.value(), bit5.value(), bit4.value(), bit3.value(), bit2.value(), bit1.value(), bit0.value())
+#    print(bit7.value(),bit6.value(), bit5.value(), bit4.value(), bit3.value(), bit2.value(), bit1.value(), bit0.value())
     
-    print("Iactive: ")
-    print(" ")
+#    print("Iactive: ")
+#    print(" ")
 
-#
-# main program.  
+
+
+############ main program ###########
+#                    _                                                   
+#                   (_)                                                  
+#    _ __ ___   __ _ _ _ __    _ __  _ __ ___   __ _ _ __ __ _ _ __ ___  
+#   | '_ ` _ \ / _` | | '_ \  | '_ \| '__/ _ \ / _` | '__/ _` | '_ ` _ \ 
+#   | | | | | | (_| | | | | | | |_) | | | (_) | (_| | | | (_| | | | | | |
+#   |_| |_| |_|\__,_|_|_| |_| | .__/|_|  \___/ \__, |_|  \__,_|_| |_| |_|
+#                             | |               __/ |                    
+#                             |_|              |___/                     
 #
 opVoltRdg = machine.ADC(0)
 opVarr = [0, 0, 0, 0, 0, 0, 0, 0]
 opCurrRdg = machine.ADC(1)
 opIarr = [0, 0, 0, 0, 0, 0, 0, 0]
-op0vRdg = machine.ADC(1)
+op0vRdg = machine.ADC(1) #TODO: use the correct pins. 
 op0varr = [0, 0, 0, 0, 0, 0, 0, 0]
 lampTest()
-changeFilt = 0
 currentRange = 0
-meterDriveFilt = [0, 0, 0, 0]
-meterDriveIdx = 0
 
-# The meter update timer schedules running of the meter update code
+# The meter update timer schedules running of the meter update code. 
+# get it to run as fast as possible.  
+# Will likely need to slow it down if using print statements for testing. 
 meterUpdateTim.init(freq=10, mode=Timer.PERIODIC, callback=meterUpdateTick)
 
 

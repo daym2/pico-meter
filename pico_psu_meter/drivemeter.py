@@ -31,11 +31,11 @@
 
 # note: to run standalone on the pico, file must be called main.py
 
-#TODO:
-# set gpio23 high for continuous PWM SMPS operation. 
-
+# The following isn't that precise. In practice, the MAX_VOLTS_OUT literal
+# is adjusted to get the ADC voltage reading as close as possible to the
+# output when set to 10V. 
 # One ADC count represents...
-MAX_VOLTS_OUT = 36
+MAX_VOLTS_OUT = 46
 FULL_SCALE_COUNT = 4096
 VOLTS_PER_ADC_STEP = (MAX_VOLTS_OUT / FULL_SCALE_COUNT)
 ISENSE_R_VAL_OHMS = 0.3
@@ -48,6 +48,10 @@ import array
 import machine
 import utime
 from machine import Pin, Timer
+
+# set gpio23 high for continuous PWM SMPS operation.
+modeSmps = Pin(23, Pin.OUT)
+modeSmps.value(1)
 
 # An 8-bit R2R ladder DAC is used to drive the meter via a
 # single transistor V->I converter 
@@ -74,18 +78,28 @@ opCurrRdg = machine.ADC(1)
 op0vRdg = machine.ADC(2)
 
 # meter range indication leds
-pin100m = Pin(8,  Pin.OUT)
-pin250m = Pin(9,  Pin.OUT)
-pin500m = Pin(10, Pin.OUT)
-pin1v   = Pin(11, Pin.OUT)
-pin2v5  = Pin(12, Pin.OUT)
-pin5v   = Pin(13, Pin.OUT)
-pin10v  = Pin(14, Pin.OUT)
-pin25v  = Pin(15, Pin.OUT)
-pin50v  = Pin(16, Pin.OUT)
+pin100m = Pin(10,  Pin.OUT)
+pin250m = Pin(11,  Pin.OUT)
+pin500m = Pin(12, Pin.OUT)
+pin1v   = Pin(13, Pin.OUT)
+pin2v5  = Pin(14, Pin.OUT)
+pin5v   = Pin(15, Pin.OUT)
+pin10v  = Pin(16, Pin.OUT)
 
-# GPIO Pin 21 is used to detect current limit mode. 
+
+pin25v  = Pin(17, Pin.OUT)
+pin50v  = Pin(18, Pin.OUT)
+
+# GPIO Pin 21 is used to detect current limit mode.
+# Input = 0 when current limit is active. 
 pinILim = Pin(21, Pin.IN)
+# GPIO Pin 20 drives the red front panel Imode LED to mirror the control board LED.
+PinIlimFlag = Pin(20, Pin.OUT)
+# GPIO Pin 22 compliments to indicate voltage mode. 
+PinVoltsFlag = Pin(22, Pin.OUT)
+
+# GPIO Pin 19 is the power indicator.
+PinPwr = Pin(19, Pin.OUT)
 
 # onboard led (channel 25) is used to indicate how much time the processor is
 # spending awake.  If it never switches off, slow down the scheduling timer. 
@@ -296,32 +310,32 @@ def driveMeterToPercentFS(pcVal):
     # potentiometer and print out the ADC count while the needle was moved to
     # each graticule position using the potentiometer.  
     pc0 = 31
-    pc4 = 49
+    pc4 = 51
     pc8 = 57
-    pc12 = 61
+    pc12 = 63
     pc16 = 70
-    pc20 = 77
-    pc24 = 86
+    pc20 = 78
+    pc24 = 85
     pc28 = 91
-    pc32 = 98
-    pc36 = 104
-    pc40 = 110
-    pc44 = 117
-    pc48 = 122
-    pc52 = 132
-    pc56 = 137
-    pc60 = 143
-    pc64 = 150
-    pc68 = 155
-    pc72 = 159
-    pc76 = 165
-    pc80 = 171
-    pc84 = 176
-    pc88 = 181
-    pc92 = 185
-    pc96 = 193
-    pc100 = 200
-    pc104 = 205
+    pc32 = 96
+    pc36 = 102
+    pc40 = 109
+    pc44 = 115
+    pc48 = 121
+    pc52 = 126
+    pc56 = 131
+    pc60 = 137
+    pc64 = 143
+    pc68 = 148
+    pc72 = 153
+    pc76 = 158
+    pc80 = 164
+    pc84 = 170
+    pc88 = 174
+    pc92 = 179
+    pc96 = 184
+    pc100 = 192
+    pc104 = 197
     
     pcVal = pcVal / 100 # because this evolved using per-unit values. 
     # needle is never driven beyond 4% past the last graticule. 
@@ -410,7 +424,7 @@ def driveMeterToPercentFS(pcVal):
     # and finally, send the drive value to the Digital to Analogue Converter...
     driveMeterDAC(drive) 
         
-    # print ("%drive: ", drive)
+#    print ("%drive: ", drive)
     
 
 ############# calcModeAndRange ############
@@ -427,15 +441,15 @@ def driveMeterToPercentFS(pcVal):
 # 
 # Hysteresis is applied when changing down through ranges via the limit definitions. 
 def calcModeAndRange(Volts, Curr):
-    RANGE_50   = 0x100
-    RANGE_25   = 0x080
-    RANGE_10   = 0x040
-    RANGE_5    = 0x020
-    RANGE_2P5  = 0x010
-    RANGE_1    = 0x008
-    RANGE_500m = 0x004
-    RANGE_250m = 0x002
-    RANGE_100m = 0x001
+    RANGE_50   = 50
+    RANGE_25   = 25
+    RANGE_10   = 10
+    RANGE_5    = 5
+    RANGE_2P5  = 2.5
+    RANGE_1    = 1
+    RANGE_500m = 0.5
+    RANGE_250m = 0.25
+    RANGE_100m = 0.1
 
     # Defines limits of voltage and current for each range. 
     RANGE_50_LOW_LIM = 20.0
@@ -455,13 +469,19 @@ def calcModeAndRange(Volts, Curr):
     RANGE_250m_LOW_LIM = 0.08
     RANGE_100m_HIGH_LIM = 0.1
 
+    global rangeVolts
+    global rangeAmps
+    
     # Read pinILim to determine whether displaying volts or amps
     vMode = pinILim.value()
     #print ("vMode: ", vMode)
-    # TODO: drive the mode indicator relay lamp here. 
+
 
     if vMode == True:
         # voltage scales
+        PinVoltsFlag.value(1)
+        PinIlimFlag.value(0)
+        
         if rangeVolts == RANGE_50:
             # there is no higher voltage range. 
             if Volts < RANGE_50_LOW_LIM:
@@ -524,14 +544,25 @@ def calcModeAndRange(Volts, Curr):
                 rangeVolts = RANGE_100m
                 showRange(RANGE_INDICATOR_LAMP_100m)
             # there are no lower voltage ranges
-        # Now calculate the percentage of full scale for volts...
-        perCentDrive = rangeVolts / Volts
+        # Now calculate the percentage of full scale for volts
+        # avoiding div by 0 if ADC readings not working.
+        if Volts == 0:
+            perCentDrive = 0
+        else:
+            perCentDrive = Volts / rangeVolts 
         perCentDrive = perCentDrive * 100
+        #print("Volts: ",Volts, " rangeVolts: ", rangeVolts, " perCentDrive: ", perCentDrive)
         driveMeterToPercentFS(perCentDrive) 
+
+        # prepare for the next short circuit - 
+        rangeAmps = RANGE_10
         # here endeth the voltage meter driving. 
 
     else:
         # PSU is in current limit mode.  Display Current. 
+        PinVoltsFlag.value(0)
+        PinIlimFlag.value(1)
+
         if rangeAmps == RANGE_10:
             # No point changing to higher ranges. The output transistor will
             # melt if current gets any higher. 
@@ -581,10 +612,17 @@ def calcModeAndRange(Volts, Curr):
                 rangeAmps = RANGE_100m
                 showRange(RANGE_INDICATOR_LAMP_100m)
             # there are no lower current ranges
-        # Now calculate the percentage of full scale for current...
-        perCentDrive = rangeAmps / Curr
+        # Now calculate the percentage of full scale for current
+        # avoiding div by 0 errors if ADC readings fault.
+        if Curr == 0:
+            perCentDrive = 0
+        else:
+            perCentDrive = Curr / rangeAmps
         perCentDrive = perCentDrive * 100
+        #print("Curr: ",Curr, " rangeAmps: ", rangeAmps, " perCentDrive: ", perCentDrive)
         driveMeterToPercentFS(perCentDrive)
+        #prepare for change back to volts mode after short cct ends
+        rangeVolts = RANGE_50
     # end of changing and scaling current ranges. 
 
 
@@ -611,6 +649,7 @@ def updateRdgs():
     # All arrays are the same length so just using size of first array
     for i in range(len(opVarr)):
         opVarr[i] = opVoltRdg.read_u16()>>4
+#        print("rdg ", i, " Val: ", opVarr[i])
         opIarr[i] = opCurrRdg.read_u16()>>4
         op0varr[i] = op0vRdg.read_u16()>>4
     
@@ -641,7 +680,7 @@ def updateRdgs():
     else:
         # negative voltage!
         voltsVal = 0
-        print("op volt error")  
+        #print("op volt error")  
     #scale to real voltage
     voltsOut = voltsVal* VOLTS_PER_ADC_STEP
         
@@ -650,7 +689,7 @@ def updateRdgs():
     else:
         # negative current!  Maybe light the amber measurement warning lamp?  
         iVal = 0
-        print ("op I error")
+        #print ("op I error")
 
     iOut = iVal * AMPS_PER_ADC_STEP
 
@@ -681,18 +720,22 @@ def updateRdgs():
 #                             | |               __/ |                    
 #                             |_|              |___/                     
 #
-opVoltRdg = machine.ADC(0)
+opVoltRdg = machine.ADC(2)
 opVarr = [0, 0, 0, 0, 0, 0, 0, 0]
 opCurrRdg = machine.ADC(1)
 opIarr = [0, 0, 0, 0, 0, 0, 0, 0]
-op0vRdg = machine.ADC(1) #TODO: use the correct pins. 
+op0vRdg = machine.ADC(0)
 op0varr = [0, 0, 0, 0, 0, 0, 0, 0]
+PinPwr.value(1) #power indicator
 lampTest()
 currentRange = 0
 
+rangeVolts = 1
+rangeAmps = 1
 # The meter update timer schedules running of the meter update code. 
 # get it to run as fast as possible.  
 # Will likely need to slow it down if using print statements for testing. 
-meterUpdateTim.init(freq=10, mode=Timer.PERIODIC, callback=meterUpdateTick)
+#meterUpdateTim.init(freq=10, mode=Timer.PERIODIC, callback=meterUpdateTick)
+meterUpdateTim.init(freq=35, mode=Timer.PERIODIC, callback=meterUpdateTick)
 
 
